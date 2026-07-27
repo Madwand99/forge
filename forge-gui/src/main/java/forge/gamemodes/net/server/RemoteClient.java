@@ -7,7 +7,7 @@ import forge.trackable.Tracker;
 import forge.gamemodes.net.event.IdentifiableNetEvent;
 import forge.gamemodes.net.event.NetEvent;
 import forge.util.IHasForgeLog;
-
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 
 import java.util.concurrent.atomic.AtomicInteger;
@@ -20,8 +20,12 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
     private volatile Channel channel;
     private String username;
     private int index = UNASSIGNED_SLOT;
+    private boolean libgdx;
     private volatile ReplyPool replies = new ReplyPool();
+    private volatile Tracker codecTracker;
+    private volatile int codecConsumerId = -1;
     private final AtomicInteger sendErrors = new AtomicInteger(0);
+    private RemoteClientGuiGame gui;
 
     // Package-private: SaturationLoggingHandler reads/resets these on writability transitions
     volatile long saturationStartMs = 0L;
@@ -39,11 +43,13 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
 
     /**
      * Swap the underlying channel for a reconnecting client.
-     * Updates the channel and creates a fresh ReplyPool.
+     * Updates the channel, creates a fresh ReplyPool, and re-applies the codec
+     * tracker to the new channel's pipeline so IdRef resolution keeps working.
      */
     public void swapChannel(final Channel newChannel) {
         this.channel = newChannel;
         this.replies = new ReplyPool();
+        applyCodecTracker(newChannel);
     }
 
     /**
@@ -54,16 +60,40 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
         return index >= 0;
     }
 
+    /** Encodes synchronously on the caller's thread. Returns null on failure (logged). */
+    private ByteBuf encodeOnCallingThread(final NetEvent event) {
+        final Channel ch = channel;
+        final CompatibleObjectEncoder encoder = ch.pipeline().get(CompatibleObjectEncoder.class);
+        if (encoder == null) {
+            netLog.error("No encoder in pipeline for {} (event: {})", username, event);
+            sendErrors.incrementAndGet();
+            return null;
+        }
+        try {
+            return encoder.encodeToBuf(event, ch.alloc());
+        } catch (Exception e) {
+            sendErrors.incrementAndGet();
+            netLog.error(e, "Network encode error for {} (event: {})", username, event);
+            return null;
+        }
+    }
+
     @Override
     public void send(final NetEvent event) {
         final Channel ch = channel;
         recordSendIfSaturated(ch);
-        ch.writeAndFlush(event).addListener(f -> {
+        final ByteBuf encoded = encodeOnCallingThread(event);
+        if (encoded == null) return;
+        ch.writeAndFlush(encoded).addListener(f -> {
             if (!f.isSuccess()) {
                 sendErrors.incrementAndGet();
                 Throwable c = f.cause();
-                String causeStr = c == null ? (f.isCancelled() ? "cancelled" : "no cause") : c.getClass().getSimpleName() + ": " + c.getMessage();
-                netLog.error("Network send error for {} (event: {}, cause: {})", username, event, causeStr);
+                if (c != null) {
+                    netLog.error(c, "Network send error for {} (event: {})", username, event);
+                } else {
+                    netLog.error("Network send error for {} (event: {}, cause: {})",
+                            username, event, f.isCancelled() ? "cancelled" : "no cause");
+                }
             }
         });
     }
@@ -72,7 +102,20 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
     public void write(final NetEvent event) {
         final Channel ch = channel;
         recordSendIfSaturated(ch);
-        ch.write(event);
+        final ByteBuf encoded = encodeOnCallingThread(event);
+        if (encoded == null) return;
+        ch.write(encoded).addListener(f -> {
+            if (!f.isSuccess()) {
+                sendErrors.incrementAndGet();
+                Throwable c = f.cause();
+                if (c != null) {
+                    netLog.error(c, "Network write error for {} (event: {})", username, event);
+                } else {
+                    netLog.error("Network write error for {} (event: {}, cause: {})",
+                            username, event, f.isCancelled() ? "cancelled" : "no cause");
+                }
+            }
+        });
     }
 
     @Override
@@ -80,12 +123,21 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
         replies.initialize(event.getId());
         final Channel ch = channel;
         recordSendIfSaturated(ch);
-        ch.writeAndFlush(event).addListener(f -> {
+        final ByteBuf encoded = encodeOnCallingThread(event);
+        if (encoded == null) {
+            replies.complete(event.getId(), null);
+            return replies.get(event.getId());
+        }
+        ch.writeAndFlush(encoded).addListener(f -> {
             if (!f.isSuccess()) {
                 sendErrors.incrementAndGet();
                 Throwable c = f.cause();
-                String causeStr = c == null ? (f.isCancelled() ? "cancelled" : "no cause") : c.getClass().getSimpleName() + ": " + c.getMessage();
-                netLog.error("sendAndWait write failed for {} (event: {}, cause: {})", username, event, causeStr);
+                if (c != null) {
+                    netLog.error(c, "sendAndWait write failed for {} (event: {})", username, event);
+                } else {
+                    netLog.error("sendAndWait write failed for {} (event: {}, cause: {})",
+                            username, event, f.isCancelled() ? "cancelled" : "no cause");
+                }
                 replies.complete(event.getId(), null);
             }
         });
@@ -106,19 +158,46 @@ public final class RemoteClient implements IToClient, IHasForgeLog {
         this.index = index;
     }
 
+    public boolean isLibgdx() {
+        return libgdx;
+    }
+    public void setLibgdx(final boolean libgdx) {
+        this.libgdx = libgdx;
+    }
+
+    public RemoteClientGuiGame getGui() {
+        return gui;
+    }
+    void setGui(final RemoteClientGuiGame gui) {
+        this.gui = gui;
+    }
+
     /**
-     * Set the tracker on the channel's encoder and decoder for IdRef
-     * replacement/resolution. Called when the game starts (before any
-     * client protocol messages arrive).
+     * Set the tracker and per-client consumerId on the channel's encoder and
+     * decoder. Called when the game starts (before any client protocol
+     * messages arrive). Cached so that {@link #swapChannel} can re-apply
+     * after a reconnect. The consumerId is the {@code DeltaSyncManager} id
+     * for this client; the encoder uses it to gate IdRef substitution to
+     * objects this client has actually been told about.
      */
-    public void setCodecTracker(Tracker tracker) {
-        CompatibleObjectEncoder encoder = channel.pipeline().get(CompatibleObjectEncoder.class);
-        if (encoder != null) {
-            encoder.setTracker(tracker);
+    public void setCodecTracker(Tracker tracker, int consumerId) {
+        this.codecTracker = tracker;
+        this.codecConsumerId = consumerId;
+        applyCodecTracker(channel);
+    }
+
+    private void applyCodecTracker(Channel ch) {
+        if (codecTracker == null || ch == null) {
+            return;
         }
-        CompatibleObjectDecoder decoder = channel.pipeline().get(CompatibleObjectDecoder.class);
+        CompatibleObjectEncoder encoder = ch.pipeline().get(CompatibleObjectEncoder.class);
+        if (encoder != null) {
+            encoder.setTracker(codecTracker);
+            encoder.setConsumerId(codecConsumerId);
+        }
+        CompatibleObjectDecoder decoder = ch.pipeline().get(CompatibleObjectDecoder.class);
         if (decoder != null) {
-            decoder.setTracker(tracker);
+            decoder.setTracker(codecTracker);
         }
     }
 
